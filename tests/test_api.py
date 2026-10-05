@@ -228,5 +228,232 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(ch["active_item_id"], direct["active_item_id"], text)
 
 
+class TransplantApiTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        db.init_db()
+        cls.client = TestClient(app)
+
+    def _project(self, name="t"):
+        return self.client.post("/api/projects", json={"name": name}).json()["id"]
+
+    def _add(self, pid, body):
+        r = self.client.post(f"/api/projects/{pid}/items", json=body)
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()["items"][-1]["id"]
+
+    def _source(self):
+        """Graph with a shared ancestor and start/end offsets."""
+        s = self._project("S")
+        a = self._add(s, abs_body(ms=200, duration=100, fixture="F", channel=1))
+        b = self._add(s, {"fixture": "F", "channel": 2, "target": 50,
+                          "duration": 50, "start_mode": "ref",
+                          "ref_id": a, "ref_edge": "end", "ref_offset": 10})
+        d = self._add(s, {"fixture": "F", "channel": 3, "target": 50,
+                          "duration": 50, "start_mode": "ref",
+                          "ref_id": b, "ref_edge": "start", "ref_offset": 5})
+        e = self._add(s, {"fixture": "F", "channel": 4, "target": 50,
+                          "duration": 50, "start_mode": "ref",
+                          "ref_id": a, "ref_edge": "start", "ref_offset": 7})
+        return s, (a, b, d, e)
+
+    def test_transplant_basic_alignment_and_id_map(self):
+        s, (a, b, d, e) = self._source()
+        t = self._project("T")
+        r = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [d, e], "landing_ms": 1000})
+        self.assertEqual(r.status_code, 201, r.text)
+        p = r.json()
+        self.assertEqual(p["id"], t)
+        self.assertEqual(p["landing_ms"], 1000)
+        self.assertEqual(p["shift_ms"], 800)
+        self.assertEqual(p["source_project_id"], s)
+        self.assertEqual(len(p["id_map"]), 4)  # a pulled once, shared
+        by_old = {m["source_id"]: m["new_id"] for m in p["id_map"]}
+        items = {i["id"]: i for i in p["items"]}
+        # earliest actual start (a) lands exactly on the landing point
+        self.assertEqual(items[by_old[a]]["actual_start"], 1000)
+        # relative differences preserved
+        self.assertEqual(items[by_old[b]]["actual_start"], 1110)
+        self.assertEqual(items[by_old[d]]["actual_start"], 1115)
+        self.assertEqual(items[by_old[e]]["actual_start"], 1007)
+        self.assertEqual(items[by_old[d]]["actual_end"], 1165)
+        # references rewired to the new ids, start/end semantics kept
+        self.assertEqual(items[by_old[b]]["ref_id"], by_old[a])
+        self.assertEqual(items[by_old[b]]["ref_edge"], "end")
+        self.assertEqual(items[by_old[b]]["ref_offset"], 10)
+        self.assertEqual(items[by_old[d]]["ref_id"], by_old[b])
+        self.assertEqual(items[by_old[e]]["ref_id"], by_old[a])
+
+    def test_source_project_unchanged_after_success(self):
+        s, (a, b, d, e) = self._source()
+        t = self._project("T2")
+        before = self.client.get(f"/api/projects/{s}").json()
+        self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [d, e], "landing_ms": 0})
+        after = self.client.get(f"/api/projects/{s}").json()
+        self.assertEqual(before, after)
+
+    def test_target_existing_items_unchanged_fields(self):
+        s, (a, b, d, e) = self._source()
+        t = self._project("T3")
+        x = self._add(t, abs_body(ms=50, duration=77, fixture="Z", channel=9,
+                                  target=123))
+        before = [i for i in self.client.get(f"/api/projects/{t}").json()["items"]
+                  if i["id"] == x]
+        self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [e], "landing_ms": 5000})
+        after = [i for i in self.client.get(f"/api/projects/{t}").json()["items"]
+                 if i["id"] == x]
+        self.assertEqual(before, after)
+
+    def test_transplant_into_empty_target_landing_zero(self):
+        s, (a, b, d, e) = self._source()
+        t = self._project("Empty")
+        r = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [a], "landing_ms": 0})
+        self.assertEqual(r.status_code, 201, r.text)
+        it = r.json()["items"][0]
+        self.assertEqual(it["actual_start"], 0)
+        self.assertEqual(it["actual_end"], 100)
+
+    def test_conflict_with_existing_target_rejected_and_atomic(self):
+        s, (a, b, d, e) = self._source()
+        t = self._project("T4")
+        # a is F/CH1 abs@200 shifted by 800 -> 1000; put a colliding item
+        self._add(t, abs_body(ms=1000, fixture="F", channel=1, target=1))
+        n_before = len(self.client.get(f"/api/projects/{t}").json()["items"])
+        r = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [d, e], "landing_ms": 1000})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("同时起步", r.json()["detail"])
+        n_after = len(self.client.get(f"/api/projects/{t}").json()["items"])
+        self.assertEqual(n_before, n_after)
+        # the whole batch rolls back (no partially inserted ancestors)
+        self.assertEqual(n_after, 1)
+        # source untouched as well
+        self.assertEqual(len(self.client.get(f"/api/projects/{s}").json()["items"]), 4)
+
+    def test_conflict_among_batch_and_target_merged_decision(self):
+        # the batch alone is valid; it only collides against a target item,
+        # so the decision is taken on the merged project, not the fragment
+        s, (a, b, d, e) = self._source()
+        t = self._project("T5")
+        # e lands on 1007 on F/CH4
+        self._add(t, abs_body(ms=1007, fixture="F", channel=4, target=9))
+        r = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [d, e], "landing_ms": 1000})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(len(self.client.get(f"/api/projects/{t}").json()["items"]), 1)
+
+    def test_empty_selection_rejected(self):
+        s, ids = self._source()
+        t = self._project("T6")
+        r = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [], "landing_ms": 0})
+        self.assertEqual(r.status_code, 422)
+
+    def test_invalid_item_rejected(self):
+        s, ids = self._source()
+        t = self._project("T7")
+        n_before = len(self.client.get(f"/api/projects/{t}").json()["items"])
+        r = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [9999], "landing_ms": 0})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("不存在", r.json()["detail"])
+        self.assertEqual(len(self.client.get(f"/api/projects/{t}").json()["items"]),
+                         n_before)
+
+    def test_item_id_from_another_project_is_invalid_for_source(self):
+        # item rowids come from one global sequence; an id that exists in
+        # a different project must count as missing for this source
+        s, (a, b, d, e) = self._source()
+        other = self._project("Other")
+        foreign = self._add(other, abs_body(ms=0, fixture="Q"))
+        t = self._project("T7b")
+        r = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [foreign], "landing_ms": 0})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.client.get(f"/api/projects/{t}").json()["items"], [])
+        # the foreign item's own project is untouched
+        self.assertEqual(len(self.client.get(f"/api/projects/{other}").json()["items"]), 1)
+
+    def test_repeated_transplants_into_same_target(self):
+        s, (a, b, d, e) = self._source()
+        t = self._project("T7c")
+        r1 = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [a], "landing_ms": 0})
+        self.assertEqual(r1.status_code, 201)
+        r2 = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [a], "landing_ms": 500})
+        self.assertEqual(r2.status_code, 201)
+        starts = sorted(i["actual_start"] for i in r2.json()["items"])
+        self.assertEqual(starts, [0, 500])
+        # a third copy colliding with the first is rejected, atomic
+        r3 = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [a], "landing_ms": 0})
+        self.assertEqual(r3.status_code, 409)
+        self.assertEqual(len(self.client.get(f"/api/projects/{t}").json()["items"]), 2)
+
+    def test_source_project_missing_404(self):
+        t = self._project("T8")
+        r = self.client.post("/api/projects/9999/transplant", json={
+            "target_project_id": t, "item_ids": [1], "landing_ms": 0})
+        self.assertEqual(r.status_code, 404)
+
+    def test_target_project_missing_rejected(self):
+        s, (a, b, d, e) = self._source()
+        r = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": 9999, "item_ids": [a], "landing_ms": 0})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("目标工程不存在", r.json()["detail"])
+
+    def test_same_source_and_target_rejected(self):
+        s, (a, b, d, e) = self._source()
+        r = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": s, "item_ids": [a], "landing_ms": 0})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("不能相同", r.json()["detail"])
+
+    def test_negative_landing_rejected(self):
+        s, (a, b, d, e) = self._source()
+        t = self._project("T9")
+        r = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [a], "landing_ms": -1})
+        self.assertEqual(r.status_code, 422)
+
+    def test_duplicate_ids_in_selection_move_once(self):
+        s, (a, b, d, e) = self._source()
+        t = self._project("T10")
+        r = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [a, a, a], "landing_ms": 0})
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(len(r.json()["id_map"]), 1)
+
+    def test_eval_in_target_matches_after_transplant(self):
+        s, (a, b, d, e) = self._source()
+        t = self._project("T11")
+        r = self.client.post(f"/api/projects/{s}/transplant", json={
+            "target_project_id": t, "item_ids": [d, e], "landing_ms": 1000})
+        by_old = {m["source_id"]: m["new_id"] for m in r.json()["id_map"]}
+        ev = self.client.get(f"/api/projects/{t}/eval", params={"t": 1050}).json()
+        ch1 = next(c for c in ev["channels"] if c["fixture"] == "F"
+                   and c["channel"] == 1)
+        # a: 0->100 over 100ms starting 1000; at 1050 it is 50
+        self.assertEqual(ch1["raw"], "50")
+        self.assertEqual(ch1["active_item_id"], by_old[a])
+
+    def test_single_item_endpoints_unchanged(self):
+        # the original create/update/delete/eval contract still behaves
+        p = self._project("T12")
+        i = self._add(p, abs_body(ms=10, duration=20, target=40))
+        got = self.client.get(f"/api/projects/{p}").json()["items"][0]
+        self.assertEqual((got["actual_start"], got["actual_end"]), (10, 30))
+        r = self.client.put(f"/api/projects/{p}/items/{i}",
+                            json=abs_body(ms=30, duration=20, target=40))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["items"][0]["actual_start"], 30)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,10 +17,12 @@ from .engine import (
     EngineError,
     Item,
     evaluate,
+    plan_transplant,
     referrer_chain,
     resolve,
+    shift_item,
 )
-from .schemas import ItemIn, ProjectIn
+from .schemas import ItemIn, ProjectIn, TransplantIn
 from .seed import seed_if_empty
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
@@ -160,6 +162,67 @@ def api_delete_item(project_id: int, item_id: int):
             )
         db.delete_item_row(conn, project_id, item_id)
         return _validate_and_payload(conn, project_id, None)
+
+
+# --------------------------------------------------------------------------
+# Cross-project fragment transplant
+# --------------------------------------------------------------------------
+
+@app.post("/api/projects/{project_id}/transplant", status_code=201)
+def api_transplant(project_id: int, data: TransplantIn):
+    """Move selected items (with all upstream references) into another project.
+
+    The whole batch — selection plus transitive ancestors, shared ones
+    once — is inserted dependency-first inside one transaction; refs are
+    rewired to the freshly allocated target ids while ancestors are being
+    written.  Only then is the *merged* target project fully validated
+    (same channel / same instant collision resolved against the combined
+    result).  Any rejection rolls the transaction back, so neither the
+    source project nor the target's existing items ever change.
+    """
+    with db.transaction() as conn:
+        get_project_or_404(conn, project_id)
+        if data.target_project_id == project_id:
+            raise HTTPException(status_code=400, detail="源工程与目标工程不能相同")
+        if not db.project_exists(conn, data.target_project_id):
+            raise HTTPException(status_code=400, detail="目标工程不存在")
+
+        source_items = db.load_items(conn, project_id)
+        try:
+            plan = plan_transplant(source_items, data.item_ids, data.landing_ms)
+        except EngineError as exc:
+            raise HTTPException(status_code=400, detail=exc.detail)
+
+        source_by_id = {it.id: it for it in source_items}
+        id_map: dict = {}
+        order = db.next_sort_order(conn, data.target_project_id)
+        # Insert dependency-first: when a ref item is reached its ancestor
+        # already has a target id, so references are rewired to real rows —
+        # never to an id guessed for an ancestor still unwritten.
+        for old_id in plan.batch_ids:
+            new_ref = id_map[source_by_id[old_id].ref_id] \
+                if source_by_id[old_id].start_mode == "ref" else None
+            it = shift_item(source_by_id[old_id], plan.shift, new_ref)
+            new_id = db.insert_item(conn, data.target_project_id, it, order)
+            order += 1
+            id_map[old_id] = new_id
+
+        # Whole-project conflict check on the merged target.  resolve()
+        # raises on missing refs / cycles / same-instant collisions, which
+        # rolls back everything inserted above (target old items included
+        # unchanged); the source project was only read.
+        try:
+            payload = project_payload(conn, data.target_project_id)
+        except EngineError as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        payload["id_map"] = [
+            {"source_id": old, "new_id": new}
+            for old, new in id_map.items()
+        ]
+        payload["source_project_id"] = project_id
+        payload["landing_ms"] = data.landing_ms
+        payload["shift_ms"] = plan.shift
+        return payload
 
 
 def _validate_and_payload(conn, project_id: int, focus_id: Optional[int]):

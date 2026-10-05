@@ -4,10 +4,13 @@ from fractions import Fraction
 from app.engine import (
     EngineError,
     Item,
+    ancestor_closure,
     evaluate,
+    plan_transplant,
     referrer_chain,
     resolve,
     round_half_up,
+    shift_item,
 )
 
 
@@ -250,6 +253,102 @@ class TestReferrerChain(unittest.TestCase):
         ]
         self.assertEqual(sorted(referrer_chain(items, 1)), [2, 3, 4])
         self.assertEqual(referrer_chain(items, 5), [])
+
+
+class TestTransplantPlanning(unittest.TestCase):
+    def _source(self):
+        # 1 abs@200 d=100 ; 2 refs 1 end+10 (d=50) ; 3 refs 2 start+5 ;
+        # 4 refs 1 start+7 ; 5 unrelated abs@1000
+        return [
+            abs_item(1, ms=200, duration=100),
+            ref_item(2, 1, edge="end", offset=10, channel=2, duration=50),
+            ref_item(3, 2, edge="start", offset=5, channel=3, duration=50),
+            ref_item(4, 1, edge="start", offset=7, channel=4, duration=50),
+            abs_item(5, channel=5, ms=1000),
+        ]
+
+    def test_empty_selection_rejected(self):
+        with self.assertRaisesRegex(EngineError, "至少选择"):
+            plan_transplant(self._source(), [], 0)
+
+    def test_unknown_item_rejected(self):
+        with self.assertRaisesRegex(EngineError, "不存在"):
+            plan_transplant(self._source(), [99], 0)
+        with self.assertRaisesRegex(EngineError, "不存在"):
+            plan_transplant(self._source(), [1, 99], 0)
+
+    def test_closure_pulls_all_upstream_and_shared_once(self):
+        plan = plan_transplant(self._source(), [3, 4], 1000)
+        # selected order preserved
+        self.assertEqual(plan.selected_ids, [3, 4])
+        # batch = {1,2,3,4}; ancestor 1 shared by 3 and 4 appears once
+        self.assertEqual(sorted(plan.batch_ids), [1, 2, 3, 4])
+        self.assertEqual(len(plan.batch_ids), 4)
+
+    def test_batch_is_dependency_first(self):
+        plan = plan_transplant(self._source(), [3, 4], 1000)
+        pos = {i: k for k, i in enumerate(plan.batch_ids)}
+        self.assertLess(pos[1], pos[2])
+        self.assertLess(pos[2], pos[3])
+        self.assertLess(pos[1], pos[4])
+
+    def test_earliest_resolved_start_aligned_to_landing(self):
+        # earliest resolved start in the fragment is item 1 at 200ms
+        plan = plan_transplant(self._source(), [3, 4], 1000)
+        self.assertEqual(plan.shift, 800)
+        # landing before the earliest start shifts backwards (still
+        # non-negative because the earliest lands on the landing point)
+        plan0 = plan_transplant(self._source(), [3, 4], 0)
+        self.assertEqual(plan0.shift, -200)
+
+    def test_earliest_considers_resolved_not_just_selected(self):
+        # selecting item 3 only: earliest of {1,2,3} is 1's start 200
+        plan = plan_transplant(self._source(), [3], 500)
+        self.assertEqual(plan.shift, 300)
+
+    def test_selection_deduped(self):
+        plan = plan_transplant(self._source(), [2, 2, 1, 2], 0)
+        self.assertEqual(plan.selected_ids, [2, 1])
+        self.assertEqual(sorted(plan.batch_ids), [1, 2])
+
+    def test_unrelated_item_not_pulled(self):
+        plan = plan_transplant(self._source(), [4], 0)
+        self.assertNotIn(5, plan.batch_ids)
+
+    def test_shift_item_preserves_duration_and_ref_semantics(self):
+        items = self._source()
+        by_id = {it.id: it for it in items}
+        moved_abs = shift_item(by_id[1], 800)
+        self.assertIsNone(moved_abs.id)
+        self.assertEqual(moved_abs.start_ms, 1000)
+        self.assertEqual(moved_abs.duration, 100)
+        moved_ref = shift_item(by_id[2], 800, new_ref_id=42)
+        self.assertEqual(moved_ref.ref_id, 42)
+        self.assertEqual(moved_ref.ref_edge, "end")
+        self.assertEqual(moved_ref.ref_offset, 10)
+        self.assertIsNone(moved_ref.start_ms)
+        self.assertEqual(moved_ref.duration, 50)
+
+    def test_rewired_batch_resolves_with_relative_times_intact(self):
+        items = self._source()
+        by_id = {it.id: it for it in items}
+        plan = plan_transplant(items, [3, 4], 1000)
+        id_map, nid, moved = {}, 100, []
+        for old in plan.batch_ids:
+            src = by_id[old]
+            new_ref = id_map[src.ref_id] if src.start_mode == "ref" else None
+            ni = shift_item(src, plan.shift, new_ref)
+            ni = Item(nid, **{k: v for k, v in vars(ni).items() if k != "id"})
+            id_map[old] = nid
+            nid += 1
+            moved.append(ni)
+        r = {ri.item.id: ri for ri in resolve(moved).items}
+        # 1 @1000-1100 ; 2 @1110 ; 3 @1115 ; 4 @1007
+        self.assertEqual((r[id_map[1]].start, r[id_map[1]].end), (1000, 1100))
+        self.assertEqual(r[id_map[2]].start, 1110)
+        self.assertEqual(r[id_map[3]].start, 1115)
+        self.assertEqual(r[id_map[4]].start, 1007)
+        self.assertEqual(r[id_map[3]].end, 1165)
 
 
 if __name__ == "__main__":

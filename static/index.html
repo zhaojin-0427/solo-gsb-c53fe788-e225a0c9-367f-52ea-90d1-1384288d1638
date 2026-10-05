@@ -13,6 +13,7 @@
     <select id="projectSelect"></select>
   </label>
   <button id="newProjectBtn" class="btn" title="新建工程">＋ 新工程</button>
+  <button id="transplantBtn" class="btn" title="把本工程所选提示项（含全部上游引用）移植到另一工程">⇄ 跨工程移植</button>
   <span class="sep"></span>
   <button id="playBtn" class="btn primary">▶ 播放</button>
   <button id="resetBtn" class="btn" title="回到 0ms">⏹ 归零</button>
@@ -31,8 +32,12 @@
       <div id="readouts" class="readouts"></div>
     </section>
     <section class="panel grow">
-      <h2 id="editorTitle">提示项</h2>
+      <div class="panel-head">
+        <h2 id="editorTitle">提示项</h2>
+        <button id="transplantBtnSide" class="btn mini" title="把本工程提示项移植到另一工程">⇄ 移植</button>
+      </div>
       <div id="editor"></div>
+      <div id="transplantBanner" class="transplant-banner hidden"></div>
     </section>
   </aside>
 
@@ -42,6 +47,7 @@
       <span class="lg instant">立即切换（0ms）</span>
       <span class="lg interrupted">被打断</span>
       <span class="lg chain">引用链</span>
+      <span class="lg transplanted">移植项</span>
       <span class="lg selected">当前选中</span>
       <span class="hint">在时间轴上按住拖动可移动播放头；点击色块编辑提示项。</span>
     </div>
@@ -50,6 +56,40 @@
     </div>
   </section>
 </main>
+
+<div id="transplantDialog" class="modal hidden">
+  <div class="modal-box">
+    <h2>跨工程移植</h2>
+    <p class="modal-intro">
+      勾选源工程的提示项；提交时会自动带上每项的<b>全部上游引用</b>（共享祖先只移植一次），
+      并把片段最早实际起步对齐到目标工程的指定落点，相对时差 / 渐变时长 / 引用开始·结束语义保持不变。
+    </p>
+    <div class="form-row">
+      <label>目标工程</label>
+      <select id="transplantTarget"></select>
+    </div>
+    <div class="form-row">
+      <label>落点（非负整数毫秒，片段最早实际起步对齐此处）</label>
+      <input id="transplantLanding" type="number" min="0" step="1" value="0">
+    </div>
+    <div class="form-row transplant-tools">
+      <label>源工程提示项（可多选）</label>
+      <span>
+        <button type="button" class="btn mini" id="transplantAll">全选</button>
+        <button type="button" class="btn mini" id="transplantNone">清空</button>
+      </span>
+    </div>
+    <div id="transplantList" class="transplant-list"></div>
+    <div id="transplantError" class="form-error" style="display:none"></div>
+    <div id="transplantResult" class="transplant-result hidden"></div>
+    <div class="form-actions">
+      <button id="transplantSubmit" class="btn primary" type="button">提交移植</button>
+      <button id="transplantCancel" class="btn" type="button">取消</button>
+      <button id="transplantClose" class="btn primary hidden" type="button">查看目标工程</button>
+      <button id="transplantStay" class="btn hidden" type="button">留在本工程</button>
+    </div>
+  </div>
+</div>
 
 <div id="errorToast" class="toast hidden"></div>
 

@@ -210,3 +210,69 @@ svg.tl { display: block; }
   box-shadow: 0 8px 30px rgba(0,0,0,.5); z-index: 50; max-width: 70vw;
 }
 .toast.hidden { display: none; }
+
+/* cross-project transplant */
+.panel-head { display: flex; align-items: center; justify-content: space-between; }
+.panel-head h2 { margin: 0; }
+.btn.mini { padding: 2px 9px; font-size: 11px; }
+
+.modal {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(8, 10, 14, .62);
+  display: flex; align-items: center; justify-content: center;
+}
+.modal.hidden { display: none; }
+.modal-box {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 18px 20px;
+  width: min(560px, 92vw); max-height: 86vh; overflow-y: auto;
+  box-shadow: 0 14px 50px rgba(0,0,0,.55);
+}
+.modal-box h2 { margin: 0 0 8px; font-size: 15px; }
+.modal-intro { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+.modal-box input[type=number] { width: 120px; }
+.modal-box select { width: 100%; }
+.transplant-tools { display: flex; align-items: flex-end; justify-content: space-between; }
+.transplant-tools span { display: flex; gap: 6px; }
+.transplant-list {
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel2); margin-bottom: 10px;
+  max-height: 240px; overflow-y: auto;
+}
+.transplant-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 10px; border-bottom: 1px solid var(--line); cursor: pointer;
+}
+.transplant-item:last-child { border-bottom: none; }
+.transplant-item:hover { background: #2b303b; }
+.transplant-item .tid { color: var(--cyan); font-weight: 700; min-width: 34px; }
+.transplant-item .tdesc { flex: 1; }
+.transplant-item .tstart { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.transplant-empty { color: var(--muted); font-size: 12px; padding: 12px; }
+.transplant-result {
+  border: 1px solid #2f5368; background: #16282f; border-radius: 8px;
+  padding: 8px 10px; margin-bottom: 10px; font-size: 12px;
+}
+.transplant-result h3 { margin: 0 0 6px; font-size: 12px; color: var(--cyan); }
+.transplant-result .map-row { color: var(--muted); margin-top: 2px; }
+.transplant-result .map-row b { color: var(--text); }
+.transplant-result .map-chip {
+  display: inline-block; margin: 2px 4px 0 0; padding: 1px 8px;
+  border-radius: 9px; background: #1f3340; border: 1px solid #2f5368;
+  color: #7fc4e8; font-variant-numeric: tabular-nums;
+}
+.transplant-banner {
+  margin-top: 10px; border: 1px solid #2f5368; background: #16282f;
+  border-radius: 8px; padding: 8px 10px; font-size: 12px; color: var(--muted);
+}
+.transplant-banner b { color: var(--cyan); }
+.transplant-banner .banner-actions { margin-top: 6px; display: flex; gap: 8px; }
+.transplant-banner .map-line { margin-top: 4px; line-height: 1.9; }
+
+/* markers for items that arrived via a transplant (new id shown, old id tagged) */
+.item-block.transplanted .item-rect { stroke: var(--cyan); stroke-width: 2; }
+.orig-tag {
+  fill: #0e2a30; font-size: 9px; pointer-events: none; font-weight: 700;
+}
+.orig-meta { color: var(--cyan); margin-top: 4px; font-size: 11px; }
+.lg.transplanted::before { background: transparent; border: 2px solid var(--cyan); }

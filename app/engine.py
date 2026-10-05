@@ -68,6 +68,26 @@ class ResolvedView:
     lanes: Dict[str, List[Segment]]  # key "fixture|channel", start order
 
 
+@dataclass
+class TransplantPlan:
+    """A resolved cross-project fragment move (pure data, no new ids yet).
+
+    * ``selected_ids`` — the chosen ids, deduped in request order;
+    * ``batch_ids`` — the selection plus every transitive upstream
+      referenced item, each appearing exactly once even when it is a
+      shared ancestor, in dependency-first order (an ancestor always
+      precedes its referrers; ties broken by the old id);
+    * ``shift`` — the ms offset added to every absolute start so the
+      fragment's earliest *resolved* start lands on the requested point.
+      Relative offsets, durations and ref start/end edges are untouched,
+      so all relative time differences survive the move.
+    """
+
+    selected_ids: List[int]
+    batch_ids: List[int]
+    shift: int
+
+
 # --------------------------------------------------------------------------
 # Validation
 # --------------------------------------------------------------------------
@@ -303,3 +323,107 @@ def referrer_chain(items: Iterable[Item], target_id: int) -> List[int]:
                 result.append(nxt)
                 frontier.append(nxt)
     return result
+
+
+# --------------------------------------------------------------------------
+# Cross-project fragment transplant planning
+# --------------------------------------------------------------------------
+
+def ancestor_closure(items: List[Item], selected: List[int]) -> List[int]:
+    """The selection plus every transitive upstream referenced item.
+
+    A shared ancestor is included exactly once.  The result is ordered
+    dependency-first (a referenced item before any of its referrers);
+    items without a dependency relation fall back to id order, so the
+    traversal is deterministic.  The source graph is already validated
+    as a DAG, so the following Kahn-style sweep always reaches everyone.
+    """
+    by_id = {it.id: it for it in items}
+    picked: set = set()
+    stack = list(selected)
+    while stack:
+        cur = stack.pop()
+        if cur in picked:
+            continue
+        picked.add(cur)
+        it = by_id[cur]
+        if it.start_mode == "ref":
+            stack.append(it.ref_id)
+
+    ordered: List[int] = []
+    placed: set = set()
+    remaining = picked
+    while remaining:
+        # the closure above guarantees a ref item's target is also in the
+        # batch, so it is ready once that ancestor has been placed
+        ready = sorted(
+            i for i in remaining
+            if by_id[i].start_mode != "ref" or by_id[i].ref_id in placed
+        )
+        # ready cannot be empty for an acyclic graph
+        ordered.extend(ready)
+        placed.update(ready)
+        remaining -= set(ready)
+    return ordered
+
+
+def plan_transplant(
+    items: List[Item], selected: List[int], landing_ms: int
+) -> TransplantPlan:
+    """Plan moving ``selected`` source items (with upstream closure) so the
+    fragment's earliest resolved start lands exactly on ``landing_ms``.
+
+    Raises EngineError on an empty selection or a selected id that does
+    not exist in the source project.  The returned plan carries no new
+    ids: the caller inserts the batch in ``batch_ids`` order, so when an
+    item references another batch item that ancestor has already been
+    written and its new id is known; refs to ancestors still unwritten at
+    planning time are handled by pre-computing the order, never by id
+    guessing.
+    """
+    selected_ids: List[int] = []
+    for sid in selected:
+        if sid not in selected_ids:
+            selected_ids.append(sid)
+    if not selected_ids:
+        raise EngineError("请至少选择一个提示项")
+    by_id = {it.id: it for it in items}
+    for sid in selected_ids:
+        if sid not in by_id:
+            raise EngineError(f"提示项 {sid} 不存在，无法移植")
+
+    batch_ids = ancestor_closure(items, selected_ids)
+
+    # Resolve the source project first — "实际起步" means the reference
+    # graph must be solved before the fragment is anchored.  This also
+    # guarantees missing refs / cycles in the source are reported rather
+    # than shifting garbage.
+    starts = resolve_starts(items, by_id)
+    earliest = min(starts[by_id[sid]] for sid in batch_ids)
+    return TransplantPlan(
+        selected_ids=selected_ids,
+        batch_ids=batch_ids,
+        shift=landing_ms - earliest,
+    )
+
+
+def shift_item(it: Item, shift: int, new_ref_id: Optional[int] = None) -> Item:
+    """A batch item translated by ``shift`` ms.
+
+    Absolute starts move with the fragment; reference starts keep their
+    edge/offset semantics.  ``new_ref_id`` rewires a reference to the
+    target-project id of its (already written) ancestor.  Both starts
+    stay integer ms because landing and source starts are integers.
+    """
+    if it.start_mode == "abs":
+        return Item(
+            id=None, fixture=it.fixture, channel=it.channel, target=it.target,
+            duration=it.duration, start_mode="abs",
+            start_ms=it.start_ms + shift,
+        )
+    return Item(
+        id=None, fixture=it.fixture, channel=it.channel, target=it.target,
+        duration=it.duration, start_mode="ref",
+        ref_id=new_ref_id if new_ref_id is not None else it.ref_id,
+        ref_edge=it.ref_edge, ref_offset=it.ref_offset,
+    )

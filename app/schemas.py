@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -49,3 +49,16 @@ class ProjectIn(BaseModel):
         if not v:
             raise ValueError("工程名称不能为空")
         return v
+
+
+class TransplantIn(BaseModel):
+    """Cross-project fragment transplant request.
+
+    The chosen source item ids (plus all transitive upstream references)
+    are moved into ``target_project_id`` as one batch, with the fragment's
+    earliest resolved start aligned to ``landing_ms``.
+    """
+
+    target_project_id: int = Field(ge=1)
+    item_ids: List[int] = Field(min_length=1)
+    landing_ms: int = Field(ge=0)

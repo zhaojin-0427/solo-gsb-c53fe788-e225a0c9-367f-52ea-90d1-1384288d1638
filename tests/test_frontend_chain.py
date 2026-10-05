@@ -49,8 +49,19 @@ APP_JS = Path(__file__).resolve().parents[1] / "static" / "app.js"
 
 
 def function_body(src: str, signature: str) -> str:
-    """Return the body of a top-level JS function (closing brace at col 0)."""
-    m = re.search(re.escape(signature) + r"\s*\{.*?\n\}", src, re.S)
+    """Return the body of a top-level JS function (closing brace at col 0).
+
+    A trailing ``()`` in ``signature`` matches any parameter list, so a
+    function gaining an optional argument (e.g. ``openProject(id,
+    pendingTransplant)``) keeps matching the same pin.
+    """
+    pattern = re.escape(signature)
+    if signature.endswith(")"):
+        # make the final parameter list match any args: an optional extra
+        # argument (e.g. openProject(id, pendingTransplant)) keeps pinning
+        head = signature[: signature.rfind("(")]
+        pattern = re.escape(head) + r"\s*\([^)]*\)"
+    m = re.search(pattern + r"\s*\{.*?\n\}", src, re.S)
     if not m:
         raise AssertionError(f"{signature} not found in app.js")
     return m.group(0)
@@ -368,6 +379,103 @@ class TestProjectDetailSequencing(unittest.TestCase):
         apply_at = applied.index("state.project = payload;")
         eval_at = applied.index("await requestEval(true);")
         self.assertLess(apply_at, eval_at)
+
+
+class TestTransplantChain(unittest.TestCase):
+    """Cross-project transplant UI wiring (static pins).
+
+    The transplant dialog must gather a multi-selection from the source
+    project, post {target_project_id, item_ids, landing_ms} to the new
+    endpoint, and — only on success — open the target project carrying the
+    old-id -> new-id map so the moved items are badged there; rejections
+    keep the dialog open and never switch the page or touch project data.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = APP_JS.read_text(encoding="utf-8")
+        cls.flat = re.sub(r"\s+", " ", cls.src)
+        cls.html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+        cls.submit = function_body(cls.src, "async function submitTransplant()")
+        cls.goto = function_body(cls.src, "async function gotoTransplantTarget()")
+        cls.open = function_body(cls.src, "async function openProject(id)")
+
+    def test_toolbar_and_dialog_present(self):
+        self.assertIn('id="transplantBtn"', self.html)
+        self.assertIn('id="transplantDialog"', self.html)
+        self.assertIn('id="transplantTarget"', self.html)
+        self.assertIn('id="transplantLanding"', self.html)
+        self.assertIn('id="transplantList"', self.html)
+
+    def test_state_for_badges_and_mapping_exists(self):
+        self.assertIn("transplant: null", self.flat)
+
+    def test_list_is_multi_checkbox_selection(self):
+        lst = function_body(self.src, "function renderTransplantList()")
+        self.assertIn('type: "checkbox"', lst)
+
+    def test_empty_selection_refused_before_request(self):
+        # the checked-box count is checked and an inline error shown, no
+        # api() call happens for an empty selection
+        head = self.submit.split("const itemIds", 1)[1]
+        guard = head.split("api(", 1)[0]
+        self.assertIn("itemIds.length", guard)
+        self.assertIn("至少勾选", guard)
+
+    def test_same_project_refused_client_side(self):
+        self.assertIn("源工程与目标工程不能相同", self.submit)
+
+    def test_landing_must_be_non_negative_integer(self):
+        self.assertIn("Number.isInteger(landingMs)", self.submit)
+        self.assertIn("landingMs < 0", self.submit)
+        self.assertIn("非负整数毫秒", self.submit)
+
+    def test_posts_correct_endpoint_and_payload(self):
+        self.assertIn("/transplant", self.submit)
+        self.assertIn('method: "POST"', self.submit)
+        self.assertIn("target_project_id: targetProjectId", self.flat)
+        self.assertIn("item_ids: itemIds", self.flat)
+        self.assertIn("landing_ms: landingMs", self.flat)
+
+    def test_failure_keeps_dialog_open_and_does_not_switch_project(self):
+        err = self.submit.rsplit("} catch (e) {", 1)[1]
+        self.assertIn("e.message", err)
+        self.assertNotIn("openProject", err)
+        self.assertNotIn("closeTransplantDialog", err)
+        self.assertNotIn("applyProjectPayload", err)
+
+    def test_success_shows_id_mapping(self):
+        res = function_body(self.src, "function showTransplantResult(payload)")
+        self.assertIn("payload.id_map", res)
+        self.assertIn("source_id", res)
+        self.assertIn("new_id", res)
+
+    def test_target_opened_with_mapping_marker(self):
+        self.assertIn("openProject(payload.id, marker)", self.goto)
+        # marker carries the same map the API returned
+        self.assertIn("idMap: payload.id_map", self.goto)
+        self.assertIn("sourceProjectId: payload.source_project_id", self.goto)
+
+    def test_open_project_applies_or_clears_marker(self):
+        # normal opens drop a previous marker; marker opens keep it
+        self.assertIn("state.transplant = pendingTransplant || null;", self.open)
+
+    def test_timeline_badges_transplanted_items(self):
+        tl = function_body(self.src, "function renderTimeline()")
+        self.assertIn("isTransplanted(it.id)", tl)
+        self.assertIn("transplantOldId(it.id)", tl)
+
+    def test_editor_shows_original_id(self):
+        ed = function_body(self.src, "function renderEditor()")
+        self.assertIn("isTransplanted(it.id)", ed)
+        self.assertIn("transplantOldId(it.id)", ed)
+
+    def test_mapping_banner_rendered_after_open_and_clearable(self):
+        self.assertIn("renderTransplantBanner();", self.open)
+        banner = function_body(self.src, "function renderTransplantBanner()")
+        self.assertIn("state.transplant = null;", banner)
+        self.assertIn("source_id", banner)
+        self.assertIn("new_id", banner)
 
 
 if __name__ == "__main__":

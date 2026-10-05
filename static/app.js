@@ -45,6 +45,12 @@ const state = {
   // beside the new playhead position.
   readoutTime: null,
   dragging: false,
+  // Result of the last cross-project transplant applied to the project
+  // currently displayed: {sourceProjectId, landingMs, shiftMs,
+  // idMap:[{source_id,new_id}]}.  Only used to badge the moved items and
+  // show the old-id -> new-id correspondence; it is purely view state and
+  // is cleared whenever another project is opened.
+  transplant: null,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -128,7 +134,7 @@ async function loadProjects(selectId) {
   localStorage.setItem("lightsProject", state.projectId);
 }
 
-async function openProject(id) {
+async function openProject(id, pendingTransplant) {
   // Take the next detail-request ticket: only the call still holding the
   // latest ticket is valid and may apply its response.  A project-id
   // comparison is not enough — in A→B→A the first A request carries the
@@ -176,6 +182,9 @@ async function openProject(id) {
   if (seq !== state.openSeq) return;
   state.project = payload;
   state.selectedId = null;
+  // a transplant landing on this opened project keeps its badges/map;
+  // otherwise the badges describe a previous landing and are dropped
+  state.transplant = pendingTransplant || null;
   buildLanes();
   // clear readouts from the old project before re-evaluating so switching
   // to an empty project leaves no stale channels on screen
@@ -185,6 +194,7 @@ async function openProject(id) {
   renderReadouts();
   renderTimeline();
   renderEditor();
+  renderTransplantBanner();
   // evaluate the live playhead instant against the project just applied:
   // eval requests made while the detail was in flight were held back (see
   // requestEval), so this is what settles the readouts on the current
@@ -282,6 +292,7 @@ function renderTimeline() {
       const classes = ["item-block"];
       if (it.id === state.selectedId) classes.push("selected");
       if (isInChain(it.id)) classes.push("chain");
+      if (isTransplanted(it.id)) classes.push("transplanted");
       const g = svgEl("g", {
         class: classes.join(" "),
         onclick: () => selectItem(it.id),
@@ -291,6 +302,13 @@ function renderTimeline() {
           x: x - 3, y: y + 6, width: 6, height: state.laneH - 12, rx: 2,
           class: "item-rect instant",
         }));
+        if (isTransplanted(it.id)) {
+          // cyan corner tick above an instant bar: the item came from a
+          // transplant (its old id is shown in the editor / banner)
+          g.appendChild(svgEl("rect", {
+            x: x - 2, y: y + 3, width: 4, height: 3, fill: "#3fc6b3",
+          }));
+        }
       } else {
         const rw = Math.max(3, it.duration * state.pxPerMs);
         const interrupted = it.interrupted_by != null;
@@ -325,6 +343,16 @@ function renderTimeline() {
         });
         mk.textContent = "↩";
         g.appendChild(mk);
+      }
+      if (it.duration !== 0 && isTransplanted(it.id)) {
+        // small "原#id" tag pinned at the block's right end, in the
+        // transplant cyan; the mapping banner lists every pair
+        const ot = svgEl("text", {
+          x: x + Math.max(4, it.duration * state.pxPerMs) - 4,
+          y: y + state.laneH - 7, "text-anchor": "end", class: "orig-tag",
+        });
+        ot.textContent = `原#${transplantOldId(it.id)}`;
+        g.appendChild(ot);
       }
       svg.appendChild(g);
     }
@@ -668,6 +696,10 @@ function renderEditor() {
       meta.appendChild(el("div", { class: "chain-list" },
         `引用：#${it.ref_id} 的${it.ref_edge === "start" ? "开始" : "结束"} + ${it.ref_offset}ms`));
     }
+    if (isTransplanted(it.id)) {
+      meta.appendChild(el("div", { class: "orig-meta" },
+        `⇄ 跨工程移植项：原工程 #${state.transplant.sourceProjectId} 的 #${transplantOldId(it.id)}`));
+    }
     if (parents.length || it.referrers.length) {
       const chain = el("div", { class: "chain-list" });
       if (parents.length) {
@@ -868,6 +900,198 @@ async function applyProjectPayload(payload) {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-project fragment transplant
+// ---------------------------------------------------------------------------
+
+function isTransplanted(id) {
+  return !!state.transplant &&
+    state.transplant.idMap.some((m) => m.new_id === id);
+}
+
+function transplantOldId(newId) {
+  const m = state.transplant &&
+    state.transplant.idMap.find((p) => p.new_id === newId);
+  return m ? m.source_id : null;
+}
+
+function transplantDialog() {
+  return $("#transplantDialog");
+}
+
+async function openTransplantDialog() {
+  if (!state.project) return;
+  const dlg = transplantDialog();
+  const err = $("#transplantError");
+  const result = $("#transplantResult");
+  err.style.display = "none";
+  err.textContent = "";
+  result.classList.add("hidden");
+  result.innerHTML = "";
+  $("#transplantSubmit").classList.remove("hidden");
+  $("#transplantCancel").classList.remove("hidden");
+  $("#transplantClose").classList.add("hidden");
+  $("#transplantStay").classList.add("hidden");
+  $("#transplantLanding").value = "0";
+  state._lastTransplant = null;
+
+  // target project dropdown = every project except the source
+  const projects = await api("/api/projects");
+  const sel = $("#transplantTarget");
+  sel.innerHTML = "";
+  for (const p of projects) {
+    if (p.id === state.project.id) continue;
+    sel.appendChild(el("option", { value: p.id },
+      `#${p.id} ${p.name}（${p.item_count} 项）`));
+  }
+
+  renderTransplantList();
+  dlg.classList.remove("hidden");
+}
+
+function renderTransplantList() {
+  const host = $("#transplantList");
+  host.innerHTML = "";
+  const items = [...(state.project ? state.project.items : [])]
+    .sort((a, b) => a.actual_start - b.actual_start || a.id - b.id);
+  if (!items.length) {
+    host.appendChild(el("div", { class: "transplant-empty" },
+      "源工程还没有提示项，无法移植。"));
+    return;
+  }
+  for (const it of items) {
+    const cb = el("input", { type: "checkbox", value: String(it.id) });
+    // pre-check the currently selected item, if any
+    if (state.selectedId === it.id) cb.checked = true;
+    const row = el("label", { class: "transplant-item" },
+      cb,
+      el("span", { class: "tid" }, `#${it.id}`),
+      el("span", { class: "tdesc" },
+        `${it.fixture} · CH${it.channel} →${it.target} · ${it.duration}ms`),
+      el("span", { class: "tstart" }, `起步 ${it.actual_start}ms`));
+    host.appendChild(row);
+  }
+}
+
+function closeTransplantDialog() {
+  // closing without navigating discards a pending success result
+  state._lastTransplant = null;
+  transplantDialog().classList.add("hidden");
+}
+
+async function submitTransplant() {
+  const err = $("#transplantError");
+  err.style.display = "none";
+  const itemIds = [...document.querySelectorAll("#transplantList input:checked")]
+    .map((cb) => Number(cb.value));
+  if (!itemIds.length) {
+    err.style.display = "";
+    err.textContent = "请至少勾选一个提示项";
+    return;
+  }
+  const targetVal = $("#transplantTarget").value;
+  if (!targetVal) {
+    err.style.display = "";
+    err.textContent = "没有可选的目标工程（请先新建另一个工程）";
+    return;
+  }
+  const targetProjectId = Number(targetVal);
+  if (targetProjectId === state.project.id) {
+    err.style.display = "";
+    err.textContent = "源工程与目标工程不能相同";
+    return;
+  }
+  const landingMs = Number($("#transplantLanding").value);
+  if (!Number.isInteger(landingMs) || landingMs < 0) {
+    err.style.display = "";
+    err.textContent = "落点必须是非负整数毫秒";
+    return;
+  }
+  try {
+    const payload = await api(
+      `/api/projects/${state.project.id}/transplant`,
+      { method: "POST", body: JSON.stringify({ target_project_id: targetProjectId,
+        item_ids: itemIds, landing_ms: landingMs }) });
+    showTransplantResult(payload);
+  } catch (e) {
+    // rejected (bad item / project, conflict ...): nothing changed on
+    // either side — keep the dialog open so the selection can be retried
+    err.style.display = "";
+    err.textContent = e.message;
+  }
+}
+
+function showTransplantResult(payload) {
+  const err = $("#transplantError");
+  err.style.display = "none";
+  const result = $("#transplantResult");
+  result.classList.remove("hidden");
+  result.innerHTML = "";
+  result.appendChild(el("h3", {}, "移植成功"));
+  result.appendChild(el("div", { class: "map-row" },
+    `目标工程 #${payload.id} ${payload.name}；片段最早实际起步已对齐 ` +
+    `${payload.landing_ms}ms（整体平移 ${payload.shift_ms >= 0 ? "+" : ""}${payload.shift_ms}ms）。`));
+  result.appendChild(el("div", { class: "map-row" },
+    "原 ID → 新 ID："));
+  const line = el("div", {},
+    ...payload.id_map.map((m) =>
+      el("span", { class: "map-chip" }, `#${m.source_id} → #${m.new_id}`)));
+  result.appendChild(line);
+  $("#transplantSubmit").classList.add("hidden");
+  $("#transplantCancel").classList.add("hidden");
+  $("#transplantClose").classList.remove("hidden");
+  $("#transplantStay").classList.remove("hidden");
+  state._lastTransplant = payload;
+}
+
+async function gotoTransplantTarget() {
+  const payload = state._lastTransplant;
+  if (!payload) return;
+  state._lastTransplant = null;
+  closeTransplantDialog();
+  setPlaying(false);
+  // open the target project and badge the moved items there (the id
+  // correspondence is shown above its editor)
+  const marker = {
+    sourceProjectId: payload.source_project_id,
+    landingMs: payload.landing_ms,
+    shiftMs: payload.shift_ms,
+    idMap: payload.id_map,
+  };
+  await openProject(payload.id, marker);
+}
+
+function stayAfterTransplant() {
+  // keep looking at the source project; discard the success state
+  state._lastTransplant = null;
+  closeTransplantDialog();
+}
+
+function renderTransplantBanner() {
+  const host = $("#transplantBanner");
+  const tr = state.transplant;
+  if (!tr || !state.project) {
+    host.classList.add("hidden");
+    host.innerHTML = "";
+    return;
+  }
+  host.classList.remove("hidden");
+  host.innerHTML = "";
+  host.appendChild(el("div", {},
+    `⇄ 已从工程 #${tr.sourceProjectId} 移植 ${tr.idMap.length} 项到本工程：` +
+    `片段最早实际起步对齐 ${tr.landingMs}ms（平移 ${tr.shiftMs >= 0 ? "+" : ""}${tr.shiftMs}ms）。`));
+  const line = el("div", { class: "map-line" },
+    ...tr.idMap.map((m) =>
+      el("span", { class: "map-chip" }, `原#${m.source_id} → 新#${m.new_id}`)));
+  host.appendChild(line);
+  host.appendChild(el("div", { class: "banner-actions" },
+    el("button", {
+      class: "btn mini", type: "button",
+      onclick: () => { state.transplant = null; renderTimeline(); renderEditor();
+        renderTransplantBanner(); },
+    }, "清除标记")));
+}
+
+// ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
 
@@ -896,6 +1120,21 @@ async function init() {
   $("#resetBtn").addEventListener("click", () => { setPlaying(false); seekTo(0); });
   $("#jumpBtn").addEventListener("click", doJump);
   $("#jumpInput").addEventListener("keydown", (e) => { if (e.key === "Enter") doJump(); });
+
+  $("#transplantBtn").addEventListener("click", openTransplantDialog);
+  $("#transplantBtnSide").addEventListener("click", openTransplantDialog);
+  $("#transplantCancel").addEventListener("click", closeTransplantDialog);
+  $("#transplantSubmit").addEventListener("click", submitTransplant);
+  $("#transplantClose").addEventListener("click", gotoTransplantTarget);
+  $("#transplantStay").addEventListener("click", stayAfterTransplant);
+  $("#transplantAll").addEventListener("click", () => {
+    document.querySelectorAll("#transplantList input[type=checkbox]")
+      .forEach((cb) => { cb.checked = true; });
+  });
+  $("#transplantNone").addEventListener("click", () => {
+    document.querySelectorAll("#transplantList input[type=checkbox]")
+      .forEach((cb) => { cb.checked = false; });
+  });
 
   window.addEventListener("resize", () => { buildLanes(); renderTimeline(); updateClockAndHead(); });
 }
