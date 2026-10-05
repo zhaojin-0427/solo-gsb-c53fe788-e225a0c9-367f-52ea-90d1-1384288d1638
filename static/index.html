@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>灯光渐变时间轴</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="toolbar">
+  <div class="brand">🎛 灯光渐变时间轴</div>
+  <label class="proj-pick">工程
+    <select id="projectSelect"></select>
+  </label>
+  <button id="newProjectBtn" class="btn" title="新建工程">＋ 新工程</button>
+  <span class="sep"></span>
+  <button id="playBtn" class="btn primary">▶ 播放</button>
+  <button id="resetBtn" class="btn" title="回到 0ms">⏹ 归零</button>
+  <label class="time-jump">跳转
+    <input id="jumpInput" type="number" min="0" step="any" value="0"> ms
+  </label>
+  <button id="jumpBtn" class="btn">Go</button>
+  <span class="spacer"></span>
+  <div id="clock" class="clock">0 ms</div>
+</header>
+
+<main class="layout">
+  <aside class="side">
+    <section class="panel">
+      <h2>通道读数</h2>
+      <div id="readouts" class="readouts"></div>
+    </section>
+    <section class="panel grow">
+      <h2 id="editorTitle">提示项</h2>
+      <div id="editor"></div>
+    </section>
+  </aside>
+
+  <section class="main">
+    <div class="legend">
+      <span class="lg bar">渐变</span>
+      <span class="lg instant">立即切换（0ms）</span>
+      <span class="lg interrupted">被打断</span>
+      <span class="lg chain">引用链</span>
+      <span class="lg selected">当前选中</span>
+      <span class="hint">在时间轴上按住拖动可移动播放头；点击色块编辑提示项。</span>
+    </div>
+    <div id="timelineScroll" class="timeline-scroll">
+      <div id="timeline"></div>
+    </div>
+  </section>
+</main>
+
+<div id="errorToast" class="toast hidden"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

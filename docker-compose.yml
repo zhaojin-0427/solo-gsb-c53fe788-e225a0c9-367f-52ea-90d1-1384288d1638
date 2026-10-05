@@ -1,0 +1,13 @@
+services:
+  lights:
+    build: .
+    image: lighting-timeline:latest
+    container_name: lighting-timeline
+    ports:
+      - "8000:8000"
+    volumes:
+      - lights-data:/data
+    restart: unless-stopped
+
+volumes:
+  lights-data:
