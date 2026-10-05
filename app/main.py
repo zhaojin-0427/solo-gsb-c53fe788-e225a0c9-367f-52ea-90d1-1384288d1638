@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from fractions import Fraction
 from typing import Optional, Union
 
@@ -17,10 +18,11 @@ from .engine import (
     EngineError,
     Item,
     evaluate,
+    port_fragment,
     referrer_chain,
     resolve,
 )
-from .schemas import ItemIn, ProjectIn
+from .schemas import ItemIn, PortIn, ProjectIn
 from .seed import seed_if_empty
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
@@ -175,6 +177,57 @@ def _validate_and_payload(conn, project_id: int, focus_id: Optional[int]):
         raise HTTPException(status_code=400, detail=exc.detail)
     payload["focus_item_id"] = focus_id
     return payload
+
+
+# --------------------------------------------------------------------------
+# Cross-project fragment porting
+# --------------------------------------------------------------------------
+
+@app.post("/api/projects/{project_id}/port", status_code=201)
+def api_port_fragment(project_id: int, data: PortIn):
+    """Port the selected items (plus all upstream references) to another
+    project, aligning the fragment's earliest actual start to the given
+    landing point.  The whole batch lands in one transaction: any
+    rejection leaves both projects untouched."""
+    with db.transaction() as conn:
+        get_project_or_404(conn, project_id)
+        if data.target_project_id == project_id:
+            raise HTTPException(status_code=400, detail="源工程与目标工程不能相同")
+        if not db.project_exists(conn, data.target_project_id):
+            raise HTTPException(status_code=404, detail="目标工程不存在")
+        source_items = db.load_items(conn, project_id)
+        try:
+            plan = port_fragment(source_items, data.item_ids, data.landing_ms)
+        except EngineError as exc:
+            raise HTTPException(status_code=400, detail=exc.detail)
+
+        # Insert ancestor-first: when a referencing item is written, every
+        # ancestor it points to already has its new id allocated, so the
+        # reference is rewired to the ported copy (never to the source id).
+        id_map = {}
+        order = db.next_sort_order(conn, data.target_project_id)
+        for old_id, proto in plan:
+            ref_id = id_map[proto.ref_id] if proto.start_mode == "ref" else None
+            new_id = db.insert_item(
+                conn, data.target_project_id,
+                replace(proto, ref_id=ref_id), order)
+            order += 1
+            id_map[old_id] = new_id
+
+        # Same-instant collisions are judged against the *merged* target
+        # project (original items + the freshly ported batch); on any
+        # violation the transaction rolls back and both sides stay as they
+        # were.  The source project is never written at all.
+        payload = _validate_and_payload(
+            conn, data.target_project_id, next(iter(id_map.values()), None))
+        payload["port"] = {
+            "source_project_id": project_id,
+            "target_project_id": data.target_project_id,
+            "landing_ms": data.landing_ms,
+            "id_map": id_map,
+            "new_item_ids": list(id_map.values()),
+        }
+        return payload
 
 
 # --------------------------------------------------------------------------

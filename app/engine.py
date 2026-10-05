@@ -277,6 +277,90 @@ def round_half_up(x: Fraction) -> int:
 
 
 # --------------------------------------------------------------------------
+# Cross-project fragment porting
+# --------------------------------------------------------------------------
+
+def port_fragment(
+    items: Iterable[Item], selected_ids: Iterable[int], landing_ms: int
+) -> List[Tuple[int, Item]]:
+    """Plan copying a fragment of ``items`` into another project.
+
+    The fragment is the selected items plus *all* their upstream
+    (transitively referenced) items, treated as one batch — a shared
+    ancestor appears exactly once.  The fragment's earliest resolved
+    actual start is aligned to ``landing_ms``; relative spacing, fade
+    durations and reference start/end semantics are preserved.
+
+    Returns ``(old_id, new_item)`` pairs in ancestor-first order so the
+    caller can insert rows one by one and rewire ``ref_id`` to the freshly
+    allocated id of an ancestor that is already written.  The returned
+    items carry ``id=None`` and still hold the *old* ``ref_id`` values.
+
+    Raises :class:`EngineError` on an empty selection, an unknown item id
+    or a negative landing point.
+    """
+    items = [it for it in items if it.id is not None]
+    by_id = {it.id: it for it in items}
+    if landing_ms < 0:
+        raise EngineError("落点必须是非负整数毫秒")
+    selected = list(dict.fromkeys(selected_ids))  # dedupe, keep order
+    if not selected:
+        raise EngineError("未选择要移植的提示项")
+    for sid in selected:
+        if sid not in by_id:
+            raise EngineError(f"提示项 #{sid} 在源工程中不存在")
+
+    # selected items plus every upstream referenced item, as one batch
+    closure = set()
+    stack = list(selected)
+    while stack:
+        cur = stack.pop()
+        if cur in closure:
+            continue
+        closure.add(cur)
+        it = by_id[cur]
+        if it.start_mode == "ref":
+            if it.ref_id not in by_id:
+                raise EngineError(f"提示项 {it.ref_id} 不存在，引用缺失")
+            stack.append(it.ref_id)
+
+    # actual starts come from resolving the source project's references
+    starts = resolve_starts(items, by_id)
+    earliest = min(starts[by_id[i]] for i in closure)
+    shift = landing_ms - earliest  # every actual start moves by this delta
+
+    # ancestors first, so a reference is always rewired to an ancestor
+    # whose new id is already allocated; deterministic for a given source
+    order: List[int] = []
+    seen = set()
+
+    def visit(i: int) -> None:
+        if i in seen:
+            return
+        seen.add(i)
+        it = by_id[i]
+        if it.start_mode == "ref" and it.ref_id in closure:
+            visit(it.ref_id)
+        order.append(i)
+
+    for i in sorted(closure):
+        visit(i)
+
+    plan: List[Tuple[int, Item]] = []
+    for old_id in order:
+        it = by_id[old_id]
+        if it.start_mode == "abs":
+            moved = Item(None, it.fixture, it.channel, it.target, it.duration,
+                         "abs", start_ms=starts[it] + shift)
+        else:
+            moved = Item(None, it.fixture, it.channel, it.target, it.duration,
+                         "ref", ref_id=it.ref_id, ref_edge=it.ref_edge,
+                         ref_offset=it.ref_offset)
+        plan.append((old_id, moved))
+    return plan
+
+
+# --------------------------------------------------------------------------
 # Reference graph helpers (for the UI chain highlighting)
 # --------------------------------------------------------------------------
 

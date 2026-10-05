@@ -5,6 +5,7 @@ from app.engine import (
     EngineError,
     Item,
     evaluate,
+    port_fragment,
     referrer_chain,
     resolve,
     round_half_up,
@@ -250,6 +251,69 @@ class TestReferrerChain(unittest.TestCase):
         ]
         self.assertEqual(sorted(referrer_chain(items, 1)), [2, 3, 4])
         self.assertEqual(referrer_chain(items, 5), [])
+
+
+class TestPortFragment(unittest.TestCase):
+    def test_empty_selection_rejected(self):
+        with self.assertRaisesRegex(EngineError, "未选择"):
+            port_fragment([abs_item(1)], [], 0)
+
+    def test_unknown_item_rejected(self):
+        with self.assertRaisesRegex(EngineError, "不存在"):
+            port_fragment([abs_item(1)], [1, 99], 0)
+
+    def test_negative_landing_rejected(self):
+        with self.assertRaisesRegex(EngineError, "落点"):
+            port_fragment([abs_item(1)], [1], -5)
+
+    def test_closure_includes_all_upstream_once(self):
+        items = [
+            abs_item(1, ms=100),
+            ref_item(2, 1, "end", 10, channel=2),
+            ref_item(3, 1, "start", 20, channel=3),  # shares ancestor 1
+            abs_item(4, ms=0),                        # not selected
+        ]
+        plan = port_fragment(items, [2, 3], 1000)
+        old_ids = [old for old, _ in plan]
+        self.assertEqual(sorted(old_ids), [1, 2, 3])  # 4 excluded, 1 once
+        # ancestors come before their dependents so ids can be rewired
+        self.assertLess(old_ids.index(1), old_ids.index(2))
+        self.assertLess(old_ids.index(1), old_ids.index(3))
+
+    def test_earliest_start_aligned_and_spacing_kept(self):
+        items = [
+            abs_item(1, ms=100, duration=50),          # 100-150
+            ref_item(2, 1, "end", 10, channel=2),      # 160-...
+            abs_item(3, ms=500, duration=0, channel=3),
+        ]
+        plan = dict(port_fragment(items, [1, 2, 3], 1000))  # shift = +900
+        self.assertEqual(plan[1].start_ms, 1000)
+        self.assertEqual(plan[3].start_ms, 1400)  # 500 + 900
+        # the ref item keeps its reference (old id, rewired by the caller),
+        # its edge and its offset; durations are copied verbatim
+        self.assertEqual(plan[2].start_mode, "ref")
+        self.assertEqual(plan[2].ref_id, 1)
+        self.assertEqual(plan[2].ref_edge, "end")
+        self.assertEqual(plan[2].ref_offset, 10)
+        self.assertEqual(plan[2].duration, items[1].duration)
+        self.assertEqual(plan[3].duration, 0)
+
+    def test_landing_before_fragment_shifts_backwards(self):
+        items = [abs_item(1, ms=2000), abs_item(2, ms=2500, channel=2)]
+        plan = dict(port_fragment(items, [1, 2], 0))  # shift = -2000
+        self.assertEqual(plan[1].start_ms, 0)
+        self.assertEqual(plan[2].start_ms, 500)
+
+    def test_new_items_have_no_id_and_fields_copied(self):
+        items = [abs_item(7, fixture="F", channel=9, target=33, duration=40, ms=5)]
+        plan = port_fragment(items, [7], 100)
+        old, moved = plan[0]
+        self.assertEqual(old, 7)
+        self.assertIsNone(moved.id)
+        self.assertEqual((moved.fixture, moved.channel, moved.target),
+                         ("F", 9, 33))
+        self.assertEqual(moved.duration, 40)
+        self.assertEqual(moved.start_ms, 100)  # earliest start == landing
 
 
 if __name__ == "__main__":

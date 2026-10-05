@@ -158,6 +158,31 @@ label.proj-pick, label.time-jump { color: var(--muted); display: flex; align-ite
 .chain-list .chip.parent { background: #1f3340; border-color: #2f5368; color: #7fc4e8; }
 .empty-note { color: var(--muted); font-size: 12px; }
 
+/* cross-project fragment porter */
+.port-items {
+  max-height: 150px; overflow-y: auto;
+  border: 1px solid var(--line); border-radius: 6px;
+  background: var(--panel2); padding: 4px 6px; margin-bottom: 8px;
+}
+.port-item {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; padding: 2px 0; cursor: pointer;
+}
+.port-item input { margin: 0; }
+.port-closure { color: var(--muted); font-size: 11px; margin-bottom: 8px; }
+.port-closure b { color: var(--cyan); }
+.port-result {
+  background: #17251c; border: 1px solid #274a33; border-radius: 6px;
+  padding: 8px 10px; margin-top: 8px; font-size: 12px;
+}
+.port-result .port-map { margin-top: 4px; }
+.port-result .chip {
+  display: inline-block; background: #1f3340; border: 1px solid #2f5368;
+  color: #8fd6a0; border-radius: 8px; padding: 0 7px; margin: 2px 3px 0 0;
+  cursor: pointer; font-size: 11px;
+}
+.port-result .port-actions { margin-top: 6px; }
+
 /* timeline */
 .legend {
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
@@ -170,6 +195,7 @@ label.proj-pick, label.time-jump { color: var(--muted); display: flex; align-ite
 .lg.interrupted::before { background: repeating-linear-gradient(45deg, var(--red) 0 3px, transparent 3px 6px); }
 .lg.chain::before { background: transparent; border: 2px dashed var(--violet); }
 .lg.selected::before { background: transparent; border: 2px solid var(--accent2); }
+.lg.ported::before { background: transparent; border: 2px solid var(--green); }
 .lg.bar::before { background: linear-gradient(90deg, rgba(240,180,41,.35), var(--accent)); }
 .hint { margin-left: auto; }
 
@@ -194,6 +220,7 @@ svg.tl { display: block; }
   stroke-dasharray: 5 3;
 }
 .item-block.chain .item-rect { stroke: var(--violet); stroke-width: 2; }
+.item-block.ported .item-rect { stroke: var(--green); stroke-width: 2.5; }
 .item-block.selected .item-rect { stroke: var(--accent2); stroke-width: 2.5; }
 .item-label { fill: #201b08; font-size: 10px; pointer-events: none; font-weight: 600; }
 .item-label.on-dark { fill: #cfe3fb; }

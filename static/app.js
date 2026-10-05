@@ -8,6 +8,7 @@
 const state = {
   projectId: null,
   project: null,          // GET /api/projects/:id
+  projects: [],           // GET /api/projects (list, for the porter panel)
   readouts: null,         // GET /api/projects/:id/eval
   time: 0,                // 播放头（ms，播放时可为小数）
   playing: false,
@@ -109,6 +110,7 @@ async function api(path, opts = {}) {
 
 async function loadProjects(selectId) {
   const projects = await api("/api/projects");
+  state.projects = projects;
   const sel = $("#projectSelect");
   sel.innerHTML = "";
   for (const p of projects) {
@@ -185,6 +187,7 @@ async function openProject(id) {
   renderReadouts();
   renderTimeline();
   renderEditor();
+  renderPorter();
   // evaluate the live playhead instant against the project just applied:
   // eval requests made while the detail was in flight were held back (see
   // requestEval), so this is what settles the readouts on the current
@@ -282,6 +285,7 @@ function renderTimeline() {
       const classes = ["item-block"];
       if (it.id === state.selectedId) classes.push("selected");
       if (isInChain(it.id)) classes.push("chain");
+      if (isPorted(it.id)) classes.push("ported");
       const g = svgEl("g", {
         class: classes.join(" "),
         onclick: () => selectItem(it.id),
@@ -862,9 +866,201 @@ async function applyProjectPayload(payload) {
   renderReadouts();
   renderTimeline();
   renderEditor();
+  renderPorter();
   await requestEval(true);
   // refresh project selector counts
   await loadProjects(state.projectId);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-project fragment porting
+// ---------------------------------------------------------------------------
+
+// The checkbox selection belongs to the project on screen (the source).
+// The last successful port's result stays visible — and keeps the ported
+// items highlighted on the target timeline — until dismissed or replaced.
+const portState = {
+  selected: new Set(),  // source item ids checked in the porter panel
+  targetId: null,       // last chosen target project id
+  landing: null,        // raw landing input text; null -> target's duration
+  result: null,         // {sourceId, targetId, targetName, landing, idMap, newIds}
+  busy: false,          // a port request is in flight
+};
+
+function portClosureIds() {
+  // selected items plus every upstream referenced item, as one batch — a
+  // shared ancestor is collected once (mirrors the server-side closure)
+  const byId = new Map(state.project.items.map((i) => [i.id, i]));
+  const out = new Set();
+  const stack = [...portState.selected];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (out.has(cur)) continue;
+    out.add(cur);
+    const it = byId.get(cur);
+    if (it && it.start_mode === "ref" && it.ref_id != null) stack.push(it.ref_id);
+  }
+  return out;
+}
+
+function isPorted(id) {
+  const r = portState.result;
+  return !!(r && state.project && state.project.id === r.targetId &&
+            r.newIds.includes(id));
+}
+
+function renderPorter() {
+  const host = $("#porter");
+  if (!host) return;
+  host.innerHTML = "";
+  if (!state.project) {
+    host.appendChild(el("div", { class: "empty-note" }, "工程加载后可移植片段。"));
+    return;
+  }
+  // drop checks for items that no longer exist (deleted / project switch)
+  const alive = new Set(state.project.items.map((i) => i.id));
+  portState.selected.forEach((id) => { if (!alive.has(id)) portState.selected.delete(id); });
+
+  const list = el("div", { class: "port-items" });
+  if (!state.project.items.length) {
+    list.appendChild(el("div", { class: "empty-note" }, "当前工程没有提示项"));
+  }
+  for (const it of state.project.items) {
+    const cb = el("input", { type: "checkbox" });
+    cb.checked = portState.selected.has(it.id);
+    cb.addEventListener("change", () => {
+      if (cb.checked) portState.selected.add(it.id);
+      else portState.selected.delete(it.id);
+      renderPorter();
+    });
+    list.appendChild(el("label", { class: "port-item" }, cb,
+      `#${it.id} ${it.fixture}·CH${it.channel} →${it.target} @${it.actual_start}ms`));
+  }
+
+  const closure = state.project.items.length ? portClosureIds() : new Set();
+  const closureNote = el("div", { class: "port-closure" },
+    portState.selected.size
+      ? `已选 ${portState.selected.size} 项；连同全部上游引用共 ${closure.size} 项作为一批移植（共享祖先只移植一次）。`
+      : "勾选若干提示项；其全部上游引用项会一并移植。");
+
+  // target: any project except the one on screen
+  const targets = (state.projects || []).filter((p) => p.id !== state.project.id);
+  const targetSel = el("select", { id: "portTarget" });
+  for (const p of targets) {
+    targetSel.appendChild(el("option", {
+      value: p.id, selected: p.id === portState.targetId,
+    }, `#${p.id} ${p.name}（${p.item_count} 项）`));
+  }
+  if (!targets.length) {
+    targetSel.appendChild(el("option", { value: "" }, "（请先用“＋ 新工程”创建目标工程）"));
+  }
+  const picked = targets.find((p) => p.id === portState.targetId) || targets[0] || null;
+  portState.targetId = picked ? picked.id : null;
+  targetSel.value = portState.targetId == null ? "" : String(portState.targetId);
+  targetSel.addEventListener("change", () => {
+    portState.targetId = Number(targetSel.value) || null;
+    portState.landing = null;  // default landing follows the new target's end
+    renderPorter();
+  });
+
+  const landingInput = el("input", {
+    id: "portLanding", type: "number", min: 0, step: 1,
+    value: portState.landing != null ? portState.landing : (picked ? picked.duration : 0),
+  });
+  landingInput.addEventListener("input", () => { portState.landing = landingInput.value; });
+
+  const errBox = el("div", { class: "form-error", style: "display:none" });
+  const submit = el("button", {
+    class: "btn primary", type: "button",
+    disabled: targets.length ? null : "disabled",
+    onclick: () => submitPort(errBox),
+  }, "移植到目标工程");
+
+  host.append(
+    el("div", { class: "form-row" },
+      el("label", {}, `源工程：#${state.project.id} ${state.project.name} — 勾选要移植的提示项`),
+      list),
+    closureNote,
+    el("div", { class: "form-row" }, el("label", {}, "目标工程"), targetSel),
+    el("div", { class: "form-row" },
+      el("label", {}, "落点（非负整数毫秒，片段最早实际起步对齐到此）"), landingInput),
+    errBox,
+    el("div", { class: "form-actions" }, submit),
+  );
+
+  const r = portState.result;
+  if (r) {
+    const box = el("div", { class: "port-result" });
+    box.appendChild(el("div", {},
+      `已移植到 #${r.targetId} ${r.targetName}（落点 ${r.landing}ms）——原 ID → 新 ID：`));
+    const mapRow = el("div", { class: "port-map" });
+    for (const [oldId, newId] of Object.entries(r.idMap)) {
+      mapRow.appendChild(el("span", {
+        class: "chip",
+        title: "点击选中该移植项",
+        onclick: () => {
+          if (state.project && state.project.id === r.targetId) selectItem(newId);
+        },
+      }, `#${oldId} → #${newId}`));
+    }
+    box.appendChild(mapRow);
+    box.appendChild(el("div", { class: "port-actions" },
+      el("button", {
+        class: "btn", type: "button",
+        onclick: () => { portState.result = null; renderPorter(); renderTimeline(); },
+      }, "清除移植标记")));
+    host.appendChild(box);
+  }
+}
+
+async function submitPort(errBox) {
+  if (portState.busy) return;
+  errBox.style.display = "none";
+  const fail = (msg) => { errBox.style.display = ""; errBox.textContent = msg; };
+  const ids = [...portState.selected];
+  if (!ids.length) return fail("请至少勾选一个提示项");
+  if (portState.targetId == null) return fail("请选择目标工程");
+  const landing = Number($("#portLanding").value);
+  if (!Number.isInteger(landing) || landing < 0) {
+    return fail("落点必须是非负整数毫秒");
+  }
+  const sourceId = state.project.id;
+  portState.busy = true;
+  try {
+    const payload = await api(`/api/projects/${sourceId}/port`, {
+      method: "POST",
+      body: JSON.stringify({
+        target_project_id: portState.targetId,
+        item_ids: ids,
+        landing_ms: landing,
+      }),
+    });
+    const port = payload.port;
+    portState.result = {
+      sourceId,
+      targetId: port.target_project_id,
+      targetName: payload.name,
+      landing: port.landing_ms,
+      idMap: port.id_map,
+      newIds: port.new_item_ids,
+    };
+    portState.selected = new Set();
+    // jump to the target project so its timeline shows the ported items
+    // (green outline) together with the old -> new id mapping above
+    await loadProjects(port.target_project_id);
+    setPlaying(false);
+    await openProject(port.target_project_id);
+    state.selectedId = port.new_item_ids[0] ?? null;
+    renderTimeline();
+    renderEditor();
+    renderPorter();
+  } catch (e) {
+    // rejected: both projects are unchanged on the server and the page
+    // keeps showing the source project exactly as before
+    fail(e.message);
+  } finally {
+    portState.busy = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +1070,7 @@ async function applyProjectPayload(payload) {
 async function init() {
   await loadProjects();
   await openProject(state.projectId);
+  renderPorter();
 
   $("#projectSelect").addEventListener("change", async (e) => {
     setPlaying(false);

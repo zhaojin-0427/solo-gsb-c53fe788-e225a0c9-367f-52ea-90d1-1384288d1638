@@ -35,4 +35,7 @@ def seed_if_empty() -> int | None:
         # this interrupts the long fade of i6
         add(fixture="面光1", channel=2, target=0, duration=500,
             start_mode="ref", ref_id=i6, ref_edge="start", ref_offset=1500)
+        # an empty second project: a ready-made target for trying the
+        # cross-project fragment port without creating one by hand
+        db.create_project(conn, "空工程")
         return pid

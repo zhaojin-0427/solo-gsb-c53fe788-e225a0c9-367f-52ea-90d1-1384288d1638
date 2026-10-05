@@ -49,3 +49,11 @@ class ProjectIn(BaseModel):
         if not v:
             raise ValueError("工程名称不能为空")
         return v
+
+
+class PortIn(BaseModel):
+    """Cross-project fragment port: selected items + their upstream refs."""
+
+    target_project_id: int = Field(ge=1)
+    item_ids: list[int] = Field(default_factory=list)
+    landing_ms: int = Field(ge=0)
